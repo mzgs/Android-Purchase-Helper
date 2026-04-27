@@ -2,6 +2,31 @@
 
 Small Kotlin helper around Google Play Billing.
 
+## Install from JitPack
+
+Add JitPack to your dependency repositories:
+
+```kotlin
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+```
+
+Then add the dependency:
+
+```kotlin
+dependencies {
+    implementation("com.github.mzgs:Android-Purchase-Helper:1.0.0")
+}
+```
+
+Replace `1.0.0` with your GitHub release tag.
+
 ## Usage
 
 ```kotlin
