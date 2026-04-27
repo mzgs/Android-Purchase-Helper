@@ -4,6 +4,9 @@ Small Kotlin helper around Google Play Billing.
 
 ## Install from JitPack
 
+[![](https://jitpack.io/v/mzgs/Android-Purchase-Helper.svg)](https://jitpack.io/#mzgs/Android-Purchase-Helper)
+  
+
 Add JitPack to your dependency repositories:
 
 ```kotlin
