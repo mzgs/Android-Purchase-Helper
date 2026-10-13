@@ -2,6 +2,9 @@ package com.mzgs.purchasehelper
 
 import android.app.Activity
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import androidx.annotation.UiThread
 import com.android.billingclient.api.AcknowledgePurchaseParams
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
@@ -16,11 +19,26 @@ import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.UnfetchedProduct
 
-class PurchaseHelper(
-    context: Context,
-    private val listener: Listener? = null,
-    enablePendingPrepaidPlans: Boolean = false,
+class PurchaseHelper internal constructor(
+    private val listener: Listener?,
+    billingClientFactory: (PurchasesUpdatedListener) -> BillingClient,
 ) : PurchasesUpdatedListener {
+
+    constructor(
+        context: Context,
+        listener: Listener? = null,
+        enablePendingPrepaidPlans: Boolean = false,
+    ) : this(listener, { updates ->
+        val pendingPurchasesParams = PendingPurchasesParams.newBuilder()
+            .enableOneTimeProducts()
+            .apply { if (enablePendingPrepaidPlans) enablePrepaidPlans() }
+            .build()
+        BillingClient.newBuilder(context.applicationContext)
+            .setListener(updates)
+            .enablePendingPurchases(pendingPurchasesParams)
+            .enableAutoServiceReconnection()
+            .build()
+    })
 
     interface Listener {
         fun onBillingDisconnected() = Unit
@@ -70,16 +88,16 @@ class PurchaseHelper(
             context: Context,
             listener: Listener? = null,
             enablePendingPrepaidPlans: Boolean = false,
-        ): PurchaseHelper = synchronized(this) {
+        ): PurchaseHelper {
             val helper = PurchaseHelper(
                 context = context,
                 listener = listener,
                 enablePendingPrepaidPlans = enablePendingPrepaidPlans,
             )
-            instance?.endConnection()
-            instance = helper
+            val previous = synchronized(this) { instance.also { instance = helper } }
+            previous?.endConnection()
             helper.startConnection()
-            helper
+            return helper
         }
 
         @JvmStatic
@@ -94,10 +112,8 @@ class PurchaseHelper(
 
         @JvmStatic
         fun clear() {
-            synchronized(this) {
-                instance?.endConnection()
-                instance = null
-            }
+            val previous = synchronized(this) { instance.also { instance = null } }
+            previous?.endConnection()
         }
 
         val isReady: Boolean
@@ -133,6 +149,7 @@ class PurchaseHelper(
             requireInstance().getSubscriptionProducts(productIds, callback)
         }
 
+        @UiThread
         fun buyProduct(
             activity: Activity,
             productDetails: ProductDetails,
@@ -144,7 +161,7 @@ class PurchaseHelper(
             return helper.buyProduct(
                 activity = activity,
                 productDetails = productDetails,
-                offerToken = offerToken ?: helper.run { productDetails.defaultOfferToken() },
+                offerToken = offerToken,
                 obfuscatedAccountId = obfuscatedAccountId,
                 obfuscatedProfileId = obfuscatedProfileId,
             )
@@ -264,43 +281,29 @@ class PurchaseHelper(
     private val lock = Any()
     private val connectionCallbacks = mutableListOf<(BillingResult) -> Unit>()
     private var isConnecting = false
-
-    private val billingClient: BillingClient
-
-    init {
-        val pendingPurchasesParams = PendingPurchasesParams.newBuilder()
-            .enableOneTimeProducts()
-            .apply {
-                if (enablePendingPrepaidPlans) {
-                    enablePrepaidPlans()
-                }
-            }
-            .build()
-
-        billingClient = BillingClient.newBuilder(context.applicationContext)
-            .setListener(this)
-            .enablePendingPurchases(pendingPurchasesParams)
-            .enableAutoServiceReconnection()
-            .build()
-    }
+    @Volatile private var closed = false
+    private val billingClient = billingClientFactory(this)
 
     val isReady: Boolean
-        get() = billingClient.isReady
+        get() = !closed && billingClient.isReady
 
     fun startConnection(callback: (BillingResult) -> Unit = {}) {
-        if (billingClient.isReady) {
-            callback(billingResult(BillingClient.BillingResponseCode.OK, "Billing client is already connected."))
-            return
-        }
-
         var shouldStartConnection = false
+        var immediateResult: BillingResult? = null
         synchronized(lock) {
-            connectionCallbacks.add(callback)
-            if (!isConnecting) {
-                isConnecting = true
-                shouldStartConnection = true
+            when {
+                closed -> immediateResult = closedResult()
+                billingClient.isReady -> immediateResult = billingResult(BillingClient.BillingResponseCode.OK, "Billing client is already connected.")
+                else -> {
+                    connectionCallbacks.add(callback)
+                    if (!isConnecting) {
+                        isConnecting = true
+                        shouldStartConnection = true
+                    }
+                }
             }
         }
+        immediateResult?.let { callback(it); return }
 
         if (!shouldStartConnection) {
             return
@@ -309,6 +312,7 @@ class PurchaseHelper(
         billingClient.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(billingResult: BillingResult) {
                 val callbacks = synchronized(lock) {
+                    if (closed) return
                     isConnecting = false
                     connectionCallbacks.toList().also { connectionCallbacks.clear() }
                 }
@@ -316,22 +320,38 @@ class PurchaseHelper(
             }
 
             override fun onBillingServiceDisconnected() {
-                synchronized(lock) {
+                val callbacks = synchronized(lock) {
+                    if (closed) return
                     isConnecting = false
+                    connectionCallbacks.toList().also { connectionCallbacks.clear() }
                 }
+                val result = billingResult(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED, "Billing service disconnected.")
+                callbacks.forEach { it(result) }
                 listener?.onBillingDisconnected()
             }
         })
     }
 
     fun endConnection() {
-        if (billingClient.isReady) {
-            billingClient.endConnection()
-        }
-        synchronized(lock) {
+        val callbacks = synchronized(lock) {
+            if (closed) return
+            closed = true
             isConnecting = false
-            connectionCallbacks.clear()
+            connectionCallbacks.toList().also { connectionCallbacks.clear() }
         }
+        try {
+            billingClient.endConnection()
+        } finally {
+            val result = closedResult()
+            callbacks.forEach { it(result) }
+        }
+    }
+
+    private fun closedResult() = billingResult(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED, "PurchaseHelper has been closed. Initialize a new instance.")
+
+    private fun onMain(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) action()
+        else Handler(Looper.getMainLooper()).post { action() }
     }
 
     fun getProducts(
@@ -388,18 +408,34 @@ class PurchaseHelper(
         callback: (ProductQueryResult) -> Unit,
     ) = getProducts(productIds, BillingClient.ProductType.SUBS, callback)
 
+    @UiThread
     fun buyProduct(
         activity: Activity,
         productDetails: ProductDetails,
-        offerToken: String? = productDetails.defaultOfferToken(),
+        offerToken: String? = null,
         obfuscatedAccountId: String? = null,
         obfuscatedProfileId: String? = null,
     ): BillingResult {
+        if (closed) return closedResult()
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            return billingResult(BillingClient.BillingResponseCode.DEVELOPER_ERROR, "The ProductDetails overload must be called on the main thread.")
+        }
+        val tokens = productDetails.offerTokens()
+        if (offerToken != null && (offerToken.isBlank() || offerToken !in tokens)) {
+            return billingResult(BillingClient.BillingResponseCode.DEVELOPER_ERROR, "Select an offer token from this product's available offers.")
+        }
+        if (offerToken == null && tokens.size > 1) {
+            return billingResult(BillingClient.BillingResponseCode.DEVELOPER_ERROR, "Multiple offers are available. Pass the offer token for the plan shown to the user.")
+        }
+        val selectedToken = offerToken ?: tokens.singleOrNull()
+        if (productDetails.productType == BillingClient.ProductType.SUBS && selectedToken == null) {
+            return billingResult(BillingClient.BillingResponseCode.ITEM_UNAVAILABLE, "No subscription offers are available.")
+        }
         val productDetailsParamsBuilder = BillingFlowParams.ProductDetailsParams.newBuilder()
             .setProductDetails(productDetails)
 
-        if (!offerToken.isNullOrBlank()) {
-            productDetailsParamsBuilder.setOfferToken(offerToken)
+        if (selectedToken != null) {
+            productDetailsParamsBuilder.setOfferToken(selectedToken)
         }
 
         val billingFlowParamsBuilder = BillingFlowParams.newBuilder()
@@ -424,27 +460,31 @@ class PurchaseHelper(
         obfuscatedProfileId: String? = null,
         callback: (BillingResult) -> Unit,
     ) {
-        getProducts(listOf(productId), productType) { result ->
-            if (result.billingResult.responseCode != BillingClient.BillingResponseCode.OK) {
-                callback(result.billingResult)
-                return@getProducts
-            }
+        onMain {
+            getProducts(listOf(productId), productType) { result ->
+                onMain launch@ {
+                    if (result.billingResult.responseCode != BillingClient.BillingResponseCode.OK) {
+                        callback(result.billingResult)
+                        return@launch
+                    }
 
-            val productDetails = result.products.firstOrNull()
-            if (productDetails == null) {
-                callback(billingResult(BillingClient.BillingResponseCode.ITEM_UNAVAILABLE, "Product not found: $productId"))
-                return@getProducts
-            }
+                    val productDetails = result.products.firstOrNull()
+                    if (productDetails == null) {
+                        callback(billingResult(BillingClient.BillingResponseCode.ITEM_UNAVAILABLE, "Product not found: $productId"))
+                        return@launch
+                    }
 
-            callback(
-                buyProduct(
-                    activity = activity,
-                    productDetails = productDetails,
-                    offerToken = offerToken ?: productDetails.defaultOfferToken(),
-                    obfuscatedAccountId = obfuscatedAccountId,
-                    obfuscatedProfileId = obfuscatedProfileId,
-                )
-            )
+                    callback(
+                        buyProduct(
+                            activity = activity,
+                            productDetails = productDetails,
+                            offerToken = offerToken,
+                            obfuscatedAccountId = obfuscatedAccountId,
+                            obfuscatedProfileId = obfuscatedProfileId,
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -636,6 +676,7 @@ class PurchaseHelper(
     }
 
     override fun onPurchasesUpdated(billingResult: BillingResult, purchases: MutableList<Purchase>?) {
+        if (closed) return
         val purchaseList = purchases.orEmpty()
         listener?.onPurchasesUpdated(billingResult, purchaseList)
 
@@ -657,7 +698,7 @@ class PurchaseHelper(
         onConnectionFailed: (BillingResult) -> Unit,
         block: () -> Unit,
     ) {
-        if (billingClient.isReady) {
+        if (isReady) {
             block()
             return
         }
@@ -711,17 +752,11 @@ class PurchaseHelper(
             ?: billingResult(BillingClient.BillingResponseCode.OK, "No product types requested.")
     }
 
-    private fun ProductDetails.defaultOfferToken(): String? {
-        val oneTimeOfferToken = oneTimePurchaseOfferDetailsList
-            ?.firstOrNull()
-            ?.offerToken
-            ?: oneTimePurchaseOfferDetails?.offerToken
-
-        return oneTimeOfferToken
-            ?: subscriptionOfferDetails
-                ?.firstOrNull()
-                ?.offerToken
-    }
+    private fun ProductDetails.offerTokens(): List<String> =
+        (if (productType == BillingClient.ProductType.SUBS) subscriptionOfferDetails.orEmpty().map { it.offerToken }
+        else oneTimePurchaseOfferDetailsList?.mapNotNull { it.offerToken }
+            ?: listOfNotNull(oneTimePurchaseOfferDetails?.offerToken))
+            .filter { it.isNotBlank() }.distinct()
 
     private fun billingResult(
         responseCode: Int,
